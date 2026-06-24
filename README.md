@@ -1,2 +1,2 @@
-# vibcoding-results
+# vibecoding results
 useful toooools
