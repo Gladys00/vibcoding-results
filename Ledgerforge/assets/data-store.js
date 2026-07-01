@@ -538,13 +538,16 @@
         });
       });
     },
-    simulateImport() {
+    simulateImport(options = {}) {
       return commit({ module: "Excel 导入", type: "导入", object: "A公司_项目台账_2026Q2.xlsx" }, (data) => {
+        const selectedSheetCount = Array.isArray(options.sheets)
+          ? options.sheets.length
+          : data.sheets.filter((sheet) => sheet.selected).length;
         const id = `IMP-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${String(data.imports.length + 1).padStart(3, "0")}`;
         data.imports.unshift({
           id,
           file: "A公司_项目台账_2026Q2.xlsx",
-          sheets: data.sheets.filter((sheet) => sheet.selected).length,
+          sheets: selectedSheetCount,
           status: "已完成",
           amount: data.projects.reduce((sum, project) => sum + sumsForProject(data, project.id).income, 0),
           rows: 136,

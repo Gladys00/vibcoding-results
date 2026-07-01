@@ -157,7 +157,8 @@ textarea {
 }
 
 .table-wrap {
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: visible;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
@@ -170,6 +171,7 @@ table {
 }
 
 th {
+  overflow: visible;
   height: 40px;
   background: #fafafa;
   color: #71717a;
@@ -177,6 +179,11 @@ th {
   text-align: left;
   padding: 0 0.85rem;
   border-bottom: 1px solid var(--line);
+}
+
+th .tooltip {
+  top: calc(100% + 6px);
+  bottom: auto;
 }
 
 td {

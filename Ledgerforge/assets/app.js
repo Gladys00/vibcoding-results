@@ -7,7 +7,6 @@
     "import-upload": "上传文件页",
     "import-sheets": "Sheet 选择页",
     "import-mapping": "字段映射页",
-    "import-assignment": "项目归属确认页",
     "import-preview": "导入预览页",
     "import-errors": "错误修正页",
     "import-confirm": "导入确认页",
@@ -40,7 +39,6 @@
     ["import-upload", "上传"],
     ["import-sheets", "Sheet"],
     ["import-mapping", "映射"],
-    ["import-assignment", "归属"],
     ["import-preview", "预览"],
     ["import-errors", "修正"],
     ["import-confirm", "确认"],
@@ -63,12 +61,14 @@
     errors: {},
     loading: new Set(),
     query: "",
-    parsedImport: null
+    parsedImport: null,
+    importSheetSelections: {},
+    importIssueActions: {}
   };
 
   let data = store.getState();
 
-  const APP_VERSION = "V1.3.2";
+  const APP_VERSION = "V1.3.2.2";
 
   const FIELD_LABELS = {
     project: "项目",
@@ -158,7 +158,8 @@
   }
 
   function routeFromHash() {
-    return (location.hash || "#dashboard").replace("#", "") || "dashboard";
+    const route = (location.hash || "#dashboard").replace("#", "") || "dashboard";
+    return route === "import-assignment" ? "import-preview" : route;
   }
 
   function refreshData() {
@@ -371,6 +372,108 @@
     const q = query.trim().toLowerCase();
     if (!q) return true;
     return values.some((value) => String(value ?? "").toLowerCase().includes(q));
+  }
+
+  function sheetKey(sheet) {
+    return String(sheet?.id || sheet?.name || "");
+  }
+
+  function importSheets() {
+    return state.parsedImport?.sheets || data.sheets || [];
+  }
+
+  function isImportSheetSelected(sheet) {
+    const key = sheetKey(sheet);
+    if (Object.prototype.hasOwnProperty.call(state.importSheetSelections, key)) {
+      return state.importSheetSelections[key];
+    }
+    return sheet?.selected !== false;
+  }
+
+  function setImportSheetSelection(key, selected) {
+    state.importSheetSelections[key] = selected;
+    if (state.parsedImport?.sheets) {
+      state.parsedImport.sheets = state.parsedImport.sheets.map((sheet) => sheetKey(sheet) === key ? { ...sheet, selected } : sheet);
+    }
+  }
+
+  function resetImportSheetSelections(sheets = []) {
+    state.importSheetSelections = {};
+    sheets.forEach((sheet) => {
+      state.importSheetSelections[sheetKey(sheet)] = sheet.selected !== false;
+    });
+  }
+
+  function selectedImportSheets() {
+    return importSheets().filter((sheet) => isImportSheetSelected(sheet));
+  }
+
+  function sourceHasSelectedSheet(source, selectedNames) {
+    const parts = String(source || "").split("/").map((part) => part.trim()).filter(Boolean);
+    return parts.some((part) => selectedNames.has(part));
+  }
+
+  function filteredParsedImport() {
+    if (!state.parsedImport) return null;
+    const sheets = selectedImportSheets();
+    const selectedNames = new Set(sheets.map((sheet) => sheet.name));
+    const ledger = state.parsedImport.ledger.filter((item) => sourceHasSelectedSheet(item.importedFrom, selectedNames));
+    const payments = state.parsedImport.payments.filter((item) => sourceHasSelectedSheet(item.importedFrom || item.note, selectedNames));
+    const invoices = state.parsedImport.invoices.filter((item) => sourceHasSelectedSheet(item.importedFrom || item.original, selectedNames));
+    const projectTempIds = new Set([...ledger, ...payments, ...invoices].map((item) => item.projectTempId));
+    const projects = state.parsedImport.projects.filter((project) => projectTempIds.has(project.tempId) || sourceHasSelectedSheet(project.importedFrom, selectedNames));
+    const warnings = state.parsedImport.warnings.filter((warning) => selectedNames.has(String(warning.location || "").split("/")[0].trim()));
+    return {
+      ...state.parsedImport,
+      sheets,
+      projects,
+      ledger,
+      payments,
+      invoices,
+      warnings,
+      rows: sheets.reduce((sum, sheet) => sum + Number(sheet.rows || 0), 0)
+    };
+  }
+
+  function importDataRequired(message = "请先上传并解析 Excel 文件，再继续当前步骤。") {
+    return `
+      <div class="panel p-6 text-center">
+        ${icon("file-spreadsheet", "mx-auto mb-3 h-9 w-9 text-zinc-500")}
+        <h3 class="text-lg font-semibold">暂无可导入数据</h3>
+        <p class="mt-2 text-sm text-zinc-500">${escapeHtml(message)}</p>
+        <button class="btn btn-primary mt-5" data-route="import-upload">${icon("upload")}上传 Excel</button>
+      </div>
+    `;
+  }
+
+  function importWarningKey(warning, index) {
+    return `${warning.location || "未知位置"}::${warning.message || "未知问题"}::${index}`;
+  }
+
+  function importWarningOptions(warning) {
+    const message = String(warning.message || "");
+    if (message.includes("未识别到台账明细字段")) {
+      return ["已跳过该行", "返回源文件补齐后重新导入"];
+    }
+    if (message.includes("欠款金额")) {
+      return ["仅作为校验参考", "返回源文件核对欠款后重新导入"];
+    }
+    if (message.includes("付款日期") && message.includes("付款金额为空")) {
+      return ["导入后在收付款中补齐金额", "返回源文件补齐金额后重新导入"];
+    }
+    return ["确认后继续导入", "返回源文件核对后重新导入"];
+  }
+
+  function importWarningAction(warning, index) {
+    const key = importWarningKey(warning, index);
+    const options = importWarningOptions(warning);
+    return state.importIssueActions[key] || options[0];
+  }
+
+  function parsedImportAmount(parsed) {
+    return (parsed?.ledger || [])
+      .filter((item) => item.type === "收入")
+      .reduce((sum, item) => sum + calculateLedgerAmount(item), 0);
   }
 
   function chip(text, tone = "neutral") {
@@ -652,7 +755,8 @@
   }
 
   function renderImportStep() {
-    const parsed = state.parsedImport;
+    const rawParsed = state.parsedImport;
+    const parsed = filteredParsedImport();
     if (isLoading("import")) return renderSkeleton();
     if (state.route === "import-upload") {
       return `
@@ -670,8 +774,8 @@
           <div>
             <h3 class="font-semibold">导入前提醒</h3>
             <ul class="mt-3 space-y-2 text-sm text-zinc-600">
-              <li>• 每个工作表可以生成原始项目，也可以归入已有项目。</li>
-              <li>• 未识别字段可映射到自定义字段。</li>
+              <li>• 每个工作表会按原始项目导入，不在导入流程中做项目归集。</li>
+              <li>• 未识别字段可在字段配置中维护映射，或作为备注信息保留。</li>
               <li>• 原始文件、工作表、行号会在导入来源中保留。</li>
               <li>• 若没有项目名称，会使用工作表名称作为项目名称。</li>
             </ul>
@@ -680,36 +784,39 @@
       `;
     }
     if (state.route === "import-sheets") {
-      const sheets = parsed?.sheets || data.sheets;
-      return table(["选择", "工作表名称", "识别类型", "行数", "状态"], sheets.map((s) => `
-        <tr>
-          <td><input type="checkbox" ${s.selected ? "checked" : ""}></td>
-          <td class="font-medium">${escapeHtml(s.name)}</td>
-          <td>${s.detected}</td>
-          <td>${s.rows}</td>
-          <td>${chip(s.selected ? "本次导入" : "暂不导入", s.selected ? "blue" : "neutral")}</td>
-        </tr>
-      `));
+      const sheets = importSheets();
+      const selectedCount = selectedImportSheets().length;
+      return `
+        <div class="panel mb-3 flex flex-wrap items-center justify-between gap-3 p-3">
+          <div class="text-sm text-zinc-500">已选择 ${selectedCount} / ${sheets.length} 个 Sheet</div>
+          <div class="flex gap-2">
+            <button class="btn" data-action="select-all-sheets">${icon("check-square")}全选</button>
+            <button class="btn" data-action="clear-all-sheets">${icon("square")}取消全选</button>
+          </div>
+        </div>
+        ${table(["选择", "工作表名称", "识别类型", "行数", "状态"], sheets.map((s) => {
+          const selected = isImportSheetSelected(s);
+          return `
+            <tr>
+              <td><input type="checkbox" data-import-sheet="${escapeHtml(sheetKey(s))}" ${selected ? "checked" : ""}></td>
+              <td class="font-medium">${escapeHtml(s.name)}</td>
+              <td>${s.detected}</td>
+              <td>${s.rows}</td>
+              <td>${chip(selected ? "本次导入" : "暂不导入", selected ? "blue" : "neutral")}</td>
+            </tr>
+          `;
+        }))}
+      `;
     }
     if (state.route === "import-mapping") {
-      const mappings = parsed?.mappings || data.mappings;
+      const mappings = rawParsed?.mappings || data.mappings;
       return table(["表格列", "系统字段", "置信度", "处理", "操作"], mappings.map((m) => `
         <tr>
           <td class="font-medium">${escapeHtml(m.excel)}</td>
           <td>${escapeHtml(m.system)}</td>
           <td>${chip(m.confidence, m.confidence === "高" ? "green" : m.confidence === "中" ? "amber" : "blue")}</td>
           <td>${m.action}</td>
-          <td><button class="btn" data-modal="field">${icon("settings-2")}调整</button></td>
-        </tr>
-      `));
-    }
-    if (state.route === "import-assignment") {
-      return table(["Sheet", "归属方式", "项目 / 归集", "提示"], data.sheets.filter((s) => s.selected).map((s, i) => `
-        <tr>
-          <td class="font-medium">${escapeHtml(s.name)}</td>
-          <td><select class="rounded-lg border border-zinc-200 px-2 py-1 text-sm"><option>${i === 0 ? "归入已有项目" : "新建原始项目并绑定统计归集"}</option><option>新建原始项目</option></select></td>
-          <td>${i === 0 ? "25年3月A公司项目" : "A公司年度合作"}</td>
-          <td>${chip(i === 0 ? "疑似已有项目" : "建议归集", i === 0 ? "amber" : "blue")}</td>
+          <td><button class="btn" data-modal="mapping" data-edit-mapping="${escapeHtml(m.id || "")}" data-edit-mapping-excel="${escapeHtml(m.excel)}">${icon("settings-2")}调整</button></td>
         </tr>
       `));
     }
@@ -722,6 +829,14 @@
             { label: "收付款记录", value: parsed.payments.length, change: parsed.warnings.length ? `${parsed.warnings.length} 条提示` : "已识别", tone: parsed.warnings.length ? "warn" : "up" },
             { label: "发票记录", value: parsed.invoices.length, change: "按发票情况生成", tone: "neutral" }
           ])}
+          <div class="mt-5">${table(["文件", "Sheet", "行数", "状态"], parsed.sheets.map((s) => `
+            <tr>
+              <td>${escapeHtml(parsed.fileName)}</td>
+              <td class="font-medium">${escapeHtml(s.name)}</td>
+              <td>${s.rows}</td>
+              <td>${chip("本次导入", "blue")}</td>
+            </tr>
+          `), "暂无已选择 Sheet")}</div>
           <div class="mt-5">${table(["项目", "客户", "台账明细", "收付款", "发票", "来源"], parsed.projects.map((p) => `
             <tr>
               <td class="font-medium">${escapeHtml(p.name)}</td>
@@ -732,29 +847,71 @@
               <td>${escapeHtml(p.importedFrom)}</td>
             </tr>
           `), "未解析到项目")}</div>
+          <div class="mt-5">${table(["收支方向", "往来单位", "品名", "数量", "单价", helpLabel(label("ledgerAmount")), "来源"], parsed.ledger.map((item) => `
+            <tr>
+              <td>${chip(item.type, item.type === "收入" ? "green" : "amber")}</td>
+              <td>${escapeHtml(item.partner)}</td>
+              <td class="font-medium">${escapeHtml(item.item)}</td>
+              <td>${item.qty}</td>
+              <td>${money(item.price)}</td>
+              <td>${money(calculateLedgerAmount(item))}</td>
+              <td>${escapeHtml(item.importedFrom)}</td>
+            </tr>
+          `), "未解析到台账明细")}</div>
+          <div class="mt-5">${table(["方向", "往来单位", "日期", helpLabel(label("paymentAmount")), "状态", "来源"], parsed.payments.map((item) => `
+            <tr>
+              <td>${chip(item.direction, item.direction === "收款" ? "green" : "amber")}</td>
+              <td>${escapeHtml(item.partner)}</td>
+              <td>${escapeHtml(item.date || "-")}</td>
+              <td>${money(item.amount)}</td>
+              <td>${escapeHtml(item.status)}</td>
+              <td>${escapeHtml(item.importedFrom || item.note)}</td>
+            </tr>
+          `), "未解析到收付款记录")}</div>
+          <div class="mt-5">${table(["类型", "往来单位", "发票号", "日期", helpLabel(label("invoiceAmount")), "状态", "来源"], parsed.invoices.map((item) => `
+            <tr>
+              <td>${chip(item.type, item.type === "开票" ? "green" : "amber")}</td>
+              <td>${escapeHtml(item.partner)}</td>
+              <td>${escapeHtml(item.no || "-")}</td>
+              <td>${escapeHtml(item.date || "-")}</td>
+              <td>${money(item.amount)}</td>
+              <td>${escapeHtml(item.status)}</td>
+              <td>${escapeHtml(item.importedFrom || item.original)}</td>
+            </tr>
+          `), "未解析到发票记录")}</div>
           <div class="mt-5">${table(["级别", "位置", "问题", "处理建议"], parsed.warnings.map((w) => `
             <tr><td>${chip(w.level, w.level === "错误" ? "red" : "amber")}</td><td>${escapeHtml(w.location)}</td><td>${escapeHtml(w.message)}</td><td>${escapeHtml(w.suggestion)}</td></tr>
           `), "暂无需要处理的问题")}</div>
         `;
       }
-      return `
-        ${metricsGrid([
-          { label: "将创建项目", value: 3, change: "1 个已有", tone: "neutral" },
-          { label: "台账明细", value: 103, change: "可导入", tone: "up" },
-          { label: "收付款记录", value: 18, change: "2 条警告", tone: "warn" },
-          { label: "发票记录", value: 12, change: "4 条文本", tone: "warn" }
-        ])}
-        <div class="mt-5">${table(["级别", "位置", "问题", "处理建议"], [
-          `<tr><td>${chip("错误", "red")}</td><td>Sheet: A公司补材料 / 行 18</td><td>收付款金额为空，但付款日期存在</td><td><button class="btn" data-route="import-errors">修正</button></td></tr>`,
-          `<tr><td>${chip("警告", "amber")}</td><td>Sheet: A公司设备追加 / 行 6</td><td>发票情况为文本，建议后续结构化</td><td><button class="btn" data-action="allow-warning">允许继续</button></td></tr>`
-        ])}</div>
-      `;
+      return importDataRequired("导入预览只展示本次上传并解析出的真实数据。");
     }
     if (state.route === "import-errors") {
-      return table(["选择", "文件 / Sheet / 行号", "字段", "当前值", "处理"], [
-        `<tr><td><input type="checkbox" checked></td><td>A公司_项目台账_2026Q2.xlsx / A公司补材料 / 行 18</td><td>收付款金额</td><td class="text-red-600">空</td><td><input class="w-32 rounded-lg border border-zinc-200 px-2 py-1" value="32000"></td></tr>`,
-        `<tr><td><input type="checkbox" checked></td><td>A公司_项目台账_2026Q2.xlsx / A公司设备追加 / 行 6</td><td>重复导入</td><td>疑似 P-2604-A02</td><td><select class="rounded-lg border border-zinc-200 px-2 py-1"><option>跳过</option><option>覆盖</option><option>作为新记录</option></select></td></tr>`
-      ]);
+      if (!parsed) return importDataRequired("修正页只处理本次上传文件解析出的真实问题。");
+      return `
+        ${metricsGrid([
+          { label: "待处理问题", value: parsed.warnings.length, change: parsed.warnings.length ? "来自解析结果" : "暂无问题", tone: parsed.warnings.length ? "warn" : "up" },
+          { label: "已选择 Sheet", value: parsed.sheets.length, change: "本次导入", tone: "neutral" },
+          { label: "台账明细", value: parsed.ledger.length, change: "可继续导入", tone: "up" },
+          { label: "收付款记录", value: parsed.payments.length, change: "含待核对项", tone: parsed.payments.some((item) => item.status === "待核对") ? "warn" : "neutral" }
+        ])}
+        <div class="mt-5">${table(["位置", "问题", "当前处理建议", "处理"], parsed.warnings.map((w, index) => {
+          const options = importWarningOptions(w);
+          const selected = importWarningAction(w, index);
+          return `
+            <tr>
+              <td>${escapeHtml(parsed.fileName)} / ${escapeHtml(w.location)}</td>
+              <td><div class="font-medium">${escapeHtml(w.message)}</div><div class="text-xs text-zinc-500">${escapeHtml(w.level)}</div></td>
+              <td>${escapeHtml(w.suggestion || "-")}</td>
+              <td>
+                <select class="rounded-lg border border-zinc-200 px-2 py-1 text-sm" data-import-warning-action="${escapeHtml(importWarningKey(w, index))}">
+                  ${options.map((option) => `<option ${option === selected ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+                </select>
+              </td>
+            </tr>
+          `;
+        }), "暂无需要修正的问题")}</div>
+      `;
     }
     if (state.route === "import-confirm") {
       if (parsed) {
@@ -768,29 +925,36 @@
               <div class="rounded-lg border border-zinc-200 p-4"><div class="text-sm text-zinc-500">台账明细</div><div class="mt-1 font-medium">${parsed.ledger.length} 条</div></div>
               <div class="rounded-lg border border-zinc-200 p-4"><div class="text-sm text-zinc-500">提示</div><div class="mt-1 font-medium">${parsed.warnings.length} 条</div></div>
             </div>
-            <button class="btn btn-primary mt-6" data-action="simulate-import" ${isLoading("import") ? "disabled" : ""}>${loadingText("import", `${icon("check")}确认导入`)}</button>
+            <div class="mt-5">${table(["Sheet", "行数", "状态"], parsed.sheets.map((s) => `
+              <tr>
+                <td class="font-medium">${escapeHtml(s.name)}</td>
+                <td>${s.rows}</td>
+                <td>${chip("将导入", "blue")}</td>
+              </tr>
+            `), "暂无已选择 Sheet")}</div>
+            <div class="mt-5">${table(["问题", "处理"], parsed.warnings.map((w, index) => `
+              <tr>
+                <td><div class="font-medium">${escapeHtml(w.message)}</div><div class="text-xs text-zinc-500">${escapeHtml(w.location)}</div></td>
+                <td>${escapeHtml(importWarningAction(w, index))}</td>
+              </tr>
+            `), "暂无需要处理的问题")}</div>
+            <div class="mt-5 rounded-lg border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-600">
+              本次确认后将写入 ${parsed.projects.length} 个项目、${parsed.ledger.length} 条台账明细、${parsed.payments.length} 条收付款记录、${parsed.invoices.length} 条发票记录；台账金额按数量 × 单价计算，本次收入台账金额为 ${money(parsedImportAmount(parsed))}。
+            </div>
+            <button class="btn btn-primary mt-6" data-action="confirm-import" ${isLoading("import") ? "disabled" : ""}>${loadingText("import", `${icon("check")}确认导入`)}</button>
           </div>
         `;
       }
-      return `
-        <div class="panel p-6">
-          <h3 class="text-lg font-semibold">确认写入系统</h3>
-          <p class="mt-2 text-sm text-zinc-500">确认后会创建导入批次并写入操作日志。</p>
-          <div class="mt-5 grid gap-3 md:grid-cols-3">
-            <div class="rounded-lg border border-zinc-200 p-4"><div class="text-sm text-zinc-500">导入文件</div><div class="mt-1 font-medium">A公司_项目台账_2026Q2.xlsx</div></div>
-            <div class="rounded-lg border border-zinc-200 p-4"><div class="text-sm text-zinc-500">预计记录</div><div class="mt-1 font-medium">136 条</div></div>
-            <div class="rounded-lg border border-zinc-200 p-4"><div class="text-sm text-zinc-500">警告</div><div class="mt-1 font-medium">5 条</div></div>
-          </div>
-          <button class="btn btn-primary mt-6" data-action="simulate-import" ${isLoading("import") ? "disabled" : ""}>${loadingText("import", `${icon("check")}确认导入`)}</button>
-        </div>
-      `;
+      return importDataRequired("确认页只确认本次上传文件解析出的真实项目、台账、收付款和发票。");
     }
+    const latestImport = data.imports[0];
+    if (!latestImport) return importDataRequired("暂无导入结果，请先完成一次 Excel 导入。");
     return `
       ${metricsGrid([
-        { label: "导入成功", value: 131, change: "记录", tone: "up" },
-        { label: "失败", value: 0, change: "已修正", tone: "up" },
-        { label: "警告", value: 5, change: "需后续核对", tone: "warn" },
-        { label: "本月台账金额", value: data.imports[0]?.amount || 0, change: "已汇总", tone: "neutral", money: true }
+        { label: "导入批次", value: latestImport.id, change: latestImport.file, tone: "neutral" },
+        { label: "导入行数", value: latestImport.rows || 0, change: `${latestImport.sheets || 0} 个 Sheet`, tone: "up" },
+        { label: "警告", value: latestImport.warnings || 0, change: latestImport.warnings ? "需后续核对" : "暂无", tone: latestImport.warnings ? "warn" : "up" },
+        { label: "本次台账金额", value: latestImport.amount || 0, change: "已汇总", tone: "neutral", money: true }
       ])}
       <div class="mt-5 flex gap-2">
         <button class="btn btn-primary" data-route="project-detail">${icon("folder-open")}进入项目详情核对</button>
@@ -972,6 +1136,7 @@
             date: paymentDate,
             amount: paymentAmount,
             status: paymentAmount ? "已确认" : "待核对",
+            importedFrom,
             note: importedFrom
           });
           if (!paymentAmount) warnings.push({ level: "警告", location: `${sheetName} / 行 ${rowNo}`, message: "存在付款日期但付款金额为空", suggestion: "导入后在收付款中补齐金额" });
@@ -986,6 +1151,7 @@
             date: formatImportDate(pickImportValue(rowObject, "invoiceDate")),
             amount: calculateLedgerAmount(record),
             status: record.invoice,
+            importedFrom,
             original: invoiceText || record.invoice
           });
         }
@@ -1019,6 +1185,8 @@
       const parsed = parseWorkbookRows(workbook, file.name);
       if (!parsed.projects.length && !parsed.ledger.length) throw new Error("未解析到可导入的数据");
       state.parsedImport = parsed;
+      state.importIssueActions = {};
+      resetImportSheetSelections(parsed.sheets);
       state.loading.delete("parse-import");
       toastSuccess("解析成功");
       setRoute("import-preview");
@@ -1541,7 +1709,7 @@
       grouping: "创建 / 选择统计归集项目",
       export: "导出确认",
       field: state.modalPayload ? "编辑字段" : "新增字段",
-      mapping: state.modalPayload ? "编辑导入字段映射" : "新增导入字段映射"
+      mapping: state.route === "import-mapping" ? "调整字段映射" : state.modalPayload ? "编辑导入字段映射" : "新增导入字段映射"
     };
     return `
       <div class="modal-backdrop">
@@ -1700,14 +1868,19 @@
 
   function mappingForm() {
     const r = state.modalPayload || {};
-    const systemOptions = IMPORT_SYSTEM_FIELDS.map(([labelText]) => ({ value: labelText, label: labelText }));
+    const isImportMappingAdjust = state.route === "import-mapping";
+    const systemOptions = IMPORT_SYSTEM_FIELDS
+      .filter(([labelText]) => !(isImportMappingAdjust && labelText === "自定义字段"))
+      .map(([labelText]) => ({ value: labelText, label: labelText }));
+    const selectedSystem = systemOptions.some((option) => option.value === r.system) ? r.system : "";
+    const options = isImportMappingAdjust ? [{ value: "", label: "请选择系统字段" }, ...systemOptions] : systemOptions;
     return formShell("mapping",
       `<input type="hidden" name="id" value="${escapeHtml(r.id || "")}">
        ${inputField("表格列名", "excel", r.excel)}
-       ${selectFieldOptions("系统字段", "system", r.system || "自定义字段", systemOptions)}
+       ${selectFieldOptions("系统字段", "system", isImportMappingAdjust ? selectedSystem : r.system || "自定义字段", options)}
        ${selectField("置信度", "confidence", r.confidence || "高", ["高", "中", "低"])}
        ${selectField("处理方式", "action", r.action || "人工维护", ["人工维护", "自动匹配", "作为备注保留", "忽略", "仅校验"])}
-       <div class="md:col-span-2 text-sm text-zinc-500">同一个表格列名只能维护一条映射，欠款金额建议选择“欠款金额（仅校验）”。</div>`,
+       <div class="md:col-span-2 text-sm text-zinc-500">${isImportMappingAdjust ? "这里用于把表格列映射到系统已有字段；需要新增字段请到字段配置页。" : "同一个表格列名只能维护一条映射，欠款金额建议选择“欠款金额（仅校验）”。"}</div>`,
       r.id ? "更新映射" : "保存映射");
   }
 
@@ -1748,6 +1921,10 @@
 
   function nextImportStep() {
     const idx = importSteps.findIndex((s) => s[0] === state.route);
+    if (state.route === "import-sheets" && !selectedImportSheets().length) {
+      toastError("请至少选择一个 Sheet");
+      return;
+    }
     if (idx >= 0 && idx < importSteps.length - 1) setRoute(importSteps[idx + 1][0]);
   }
 
@@ -1851,6 +2028,21 @@
     return payload;
   }
 
+  function syncParsedMapping(record) {
+    if (!state.parsedImport || !record?.excel) return;
+    const excelKey = normalizeHeader(record.excel);
+    const index = state.parsedImport.mappings.findIndex((mapping) => normalizeHeader(mapping.excel) === excelKey || mapping.id === record.id);
+    const next = {
+      id: record.id || `MAP-${excelKey}`,
+      excel: record.excel,
+      system: record.system,
+      confidence: record.confidence || "高",
+      action: record.action || "人工维护"
+    };
+    if (index >= 0) state.parsedImport.mappings[index] = { ...state.parsedImport.mappings[index], ...next };
+    else state.parsedImport.mappings.push(next);
+  }
+
   function submitForm(form) {
     const type = form.getAttribute("data-submit");
     const raw = readForm(form);
@@ -1886,6 +2078,7 @@
       grouping: "更新成功"
     };
     withLoading(type, actions[type], messages[type], (result) => {
+      if (type === "mapping") syncParsedMapping(result || values);
       if (type === "project") {
         state.selectedProjectId = result.id;
         setRoute("project-detail");
@@ -1936,16 +2129,29 @@
   }
 
   function handleAction(action) {
-    if (action === "simulate-import") {
+    if (action === "confirm-import") {
       if (state.parsedImport) {
-        withLoading("import", () => store.importParsedWorkbook(state.parsedImport), "导入成功", (result) => {
+        const payload = filteredParsedImport();
+        if (!payload?.sheets.length) {
+          toastError("请至少选择一个 Sheet");
+          return;
+        }
+        withLoading("import", () => store.importParsedWorkbook(payload), "导入成功", (result) => {
           state.selectedProjectId = result.projectIds?.[0] || state.selectedProjectId;
           state.parsedImport = null;
+          state.importSheetSelections = {};
+          state.importIssueActions = {};
           setRoute("import-result");
         });
       } else {
-        withLoading("import", () => store.simulateImport(), "导入成功", () => setRoute("import-result"));
+        toastError("请先上传并解析 Excel 文件");
       }
+    }
+    if (action === "select-all-sheets" || action === "clear-all-sheets") {
+      const selected = action === "select-all-sheets";
+      importSheets().forEach((sheet) => setImportSheetSelection(sheetKey(sheet), selected));
+      toastSuccess(selected ? "已全选" : "已取消全选");
+      return;
     }
     if (action === "save-grouping") {
       withLoading("grouping", () => store.saveGrouping("A公司年度合作", data.suggestions.filter((s) => s.selected).map((s) => s.id)), "更新成功", (result) => {
@@ -2032,6 +2238,15 @@
     biz.value = normalizeLedgerBiz(type, biz.value);
   }
 
+  function mappingRecordFromTrigger(trigger) {
+    const id = trigger.getAttribute("data-edit-mapping");
+    const excel = trigger.getAttribute("data-edit-mapping-excel");
+    const stored = (data.mappings || []).find((item) => item.id === id || normalizeHeader(item.excel) === normalizeHeader(excel));
+    if (stored) return stored;
+    const parsed = (state.parsedImport?.mappings || []).find((item) => item.id === id || normalizeHeader(item.excel) === normalizeHeader(excel));
+    return parsed ? { ...parsed, id: "" } : null;
+  }
+
   document.addEventListener("click", (event) => {
     const openProject = event.target.closest("[data-open-project]");
     if (openProject) {
@@ -2068,7 +2283,7 @@
         data.payments.find((item) => item.id === modalEl.getAttribute("data-edit-payment")) ||
         data.invoices.find((item) => item.id === modalEl.getAttribute("data-edit-invoice")) ||
         data.fieldDefs.find((item) => item.id === modalEl.getAttribute("data-edit-field")) ||
-        (data.mappings || []).find((item) => item.id === modalEl.getAttribute("data-edit-mapping")) ||
+        mappingRecordFromTrigger(modalEl) ||
         null;
       openModal(type, record);
       return;
@@ -2156,6 +2371,16 @@
   document.addEventListener("change", (event) => {
     if (event.target.matches("[data-import-file]")) {
       parseImportFile(event.target.files?.[0]);
+      return;
+    }
+    if (event.target.matches("[data-import-sheet]")) {
+      setImportSheetSelection(event.target.getAttribute("data-import-sheet"), event.target.checked);
+      render();
+      return;
+    }
+    if (event.target.matches("[data-import-warning-action]")) {
+      state.importIssueActions[event.target.getAttribute("data-import-warning-action")] = event.target.value;
+      toastSuccess("处理方式已更新");
       return;
     }
     const form = event.target.closest('form[data-submit="ledger"]');
